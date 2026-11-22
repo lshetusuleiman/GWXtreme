@@ -34,7 +34,7 @@ import numpy as np
 import ray
 
 from gwxtreme.density_estimation import BoundedKDE, EnsembleNormalizingFlow
-from gwxtreme.eos_interpolator import EOSInterpolator, convert_masses
+from gwxtreme.eos_interpolator import EOSInterpolator, convert_masses, read_eos_mass_lambda_hdf5
 from gwxtreme.eos_prior import is_valid_eos
 
 logger = logging.getLogger(__name__)
@@ -1101,6 +1101,98 @@ class ParameterizedEoSSampler:
                 break
 
             old_tau = tau
+
+
+
+class EoSModelInference:
+    """Perform Bayesian inference over a finite ensemble of precomputed EoSs."""
+
+    def __init__(
+        self,
+        posterior_files: Sequence[str],
+        event_types: Sequence[str],
+        largest_observed_ns_mass: float | None = 1.97,
+        density_est_method: Literal["kde", "flow"] = "kde",
+        flow_directories: Sequence[str] | None = None,
+        integration_bounds: Sequence[tuple[float, float]] | Sequence[Sequence[tuple[float, float]]] | None = None):
+
+        self.largest_observed_ns_mass = largest_observed_ns_mass
+
+        self.joint_selector = ModelSelector(
+            posterior_files=posterior_files,
+            event_types=event_types,
+            density_est_method=density_est_method,
+            flow_directories=flow_directories,
+            integration_bounds=integration_bounds,
+        )
+
+    def _eos_log_evidence(self, interpolator: EOSInterpolator, n_grid: int = 200) -> tuple[float, list[float]]:
+        """Calculate the joint log evidence for one EoS."""
+        event_evidences = []
+        for i in range(len(self.joint_selector.density_estimators)):
+            evidence = self.joint_selector._single_event_evidence(
+                interpolator,
+                self.joint_selector.density_estimators[i],
+                self.joint_selector.event_types[i],
+                self.joint_selector.integration_bounds[i],
+                self.joint_selector.mean_mchirps[i],
+                n_grid=n_grid,
+            )
+            event_evidences.append(float(np.mean(evidence)))
+
+        if not all(np.isfinite(evidence) and evidence > 0 for evidence in event_evidences):
+            return -np.inf, event_evidences
+        joint_log_evidence = float(np.sum(np.log(event_evidences)))
+        return joint_log_evidence, event_evidences
+
+    def _log_post(self, interpolator: EOSInterpolator, n_grid: int = 200) -> float:
+        """Calculate the log posterior for one candidate EoS.
+
+        Assumes equal prior probabilities for all candidate EoSs.
+        The returned value is therefore the joint log evidence up to
+        an additive normalization constant.
+        """
+        log_evidence, _ = self._eos_log_evidence(interpolator, n_grid=n_grid)
+        return log_evidence
+
+    def run(self, eos_hdf5_file: str, n_grid: int = 200) -> dict:
+        """Calculate posterior probabilities for precomputed EoSs."""
+
+        eos_data = read_eos_mass_lambda_hdf5(eos_hdf5_file)
+
+        eos_keys = []
+        joint_log_evidences = []
+        per_event_evidences = []
+
+        for key, (masses, lambdas) in eos_data.items():
+            if self.largest_observed_ns_mass is not None and np.max(masses) < self.largest_observed_ns_mass:
+                continue
+
+            interpolator = EOSInterpolator(mass_lambda_data=(masses, lambdas))
+            log_evidence, event_evidences = self._eos_log_evidence(interpolator, n_grid=n_grid)
+            eos_keys.append(key)
+            joint_log_evidences.append(log_evidence)
+            per_event_evidences.append(event_evidences)
+
+        joint_log_evidences = np.asarray(joint_log_evidences)
+
+        if len(joint_log_evidences) == 0:
+            raise ValueError("No EoSs satisfy the maximum observed neutron-star mass.")
+
+        max_log_evidence = np.max(joint_log_evidences)
+
+        if not np.isfinite(max_log_evidence):
+            raise ValueError("All candidate EoSs have zero or invalid evidence.")
+
+        posterior = np.exp(joint_log_evidences - max_log_evidence)
+        posterior /= np.sum(posterior)
+
+        return {
+            "eos_keys": eos_keys,
+            "joint_log_evidences": joint_log_evidences,
+            "posterior_probabilities": posterior,
+            "per_event_evidences": per_event_evidences,
+        }
 
 
 def load_samples(

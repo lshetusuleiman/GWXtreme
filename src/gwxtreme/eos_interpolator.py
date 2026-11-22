@@ -113,7 +113,7 @@ def read_eos_mass_lambda_hdf5(filename: str,) -> dict[str, tuple[np.ndarray, np.
             raise ValueError("HDF5 file must contain an 'ns' group.")
 
         ns_group = hdf["ns"]
-        for key in sorted(ns_group.keys(), key=lambda x: int(x)):
+        for key in sorted(ns_group.keys(), key=lambda x: int(x.split("_")[-1])):
             dataset = ns_group[key]
             if not isinstance(dataset, h5py.Dataset):
                 raise ValueError(f"'ns/{key}' is not a dataset.")
