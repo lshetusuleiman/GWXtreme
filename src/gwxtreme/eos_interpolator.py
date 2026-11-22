@@ -25,6 +25,8 @@ on the minimum NS mass supported by the created EOS.
 
 from typing import Literal
 
+import h5py
+
 import lal
 import lalsimulation
 import numpy as np
@@ -103,6 +105,30 @@ def read_eos_mass_lambda_file(mass_lambda_file: str) -> tuple[np.ndarray, np.nda
 
     return masses, lambdas
 
+
+def read_eos_mass_lambda_hdf5(filename: str,) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    eos_data = {}
+    with h5py.File(filename, "r") as hdf:
+        if "ns" not in hdf:
+            raise ValueError("HDF5 file must contain an 'ns' group.")
+
+        ns_group = hdf["ns"]
+        for key in sorted(ns_group.keys(), key=lambda x: int(x)):
+            dataset = ns_group[key]
+            if not isinstance(dataset, h5py.Dataset):
+                raise ValueError(f"'ns/{key}' is not a dataset.")
+            fields = dataset.dtype.names
+            if fields is None or "M" not in fields or "Lambda" not in fields:
+                raise ValueError(f"'ns/{key}' must contain compound fields 'M' and 'Lambda'.")
+
+            masses = np.asarray(dataset["M"], dtype=float)
+            lambdas = np.asarray(dataset["Lambda"], dtype=float)
+
+            valid = np.isfinite(masses) & np.isfinite(lambdas)
+            masses = masses[valid]
+            lambdas = lambdas[valid]
+            eos_data[key] = (masses, lambdas)
+    return eos_data
 
 def read_eos_mass_radius_k_file(mass_radius_k_file: str):
     """Read neutron star mass, radius, and tidal Love number values from the given .txt file, representing the mass-radius-kappa relation prescribed by some equation of state.
@@ -299,6 +325,7 @@ class EOSInterpolator:
         parameterization: Literal["spectral", "polytrope"] | None = None,
         mass_lambda_file: str | None = None,
         mass_radius_k_file: str | None = None,
+        mass_lambda_data: tuple[np.ndarray, np.ndarray] | None = None,
     ):
         """Construct the combined interpolator from either a LALSuite named EOS, a mass-lambda file,
         a mass-radius-tidal Love number file, or a parameterized model from the 4-parameter spectral
@@ -369,11 +396,19 @@ class EOSInterpolator:
             If necessary arguments are missing
         """
 
-        if mass_lambda_file is not None:
+        if mass_lambda_data is not None:
+            masses, lambdas = mass_lambda_data
+            masses = np.asarray(masses, dtype=float)
+            lambdas = np.asarray(lambdas, dtype=float)
+
+            self.mass_lambda_interpolant = scipy.interpolate.interp1d(masses, lambdas)
+            self.min_mass = np.min(masses)
+            self.max_mass = np.max(masses)
+
+        elif mass_lambda_file is not None:
             masses, lambdas = read_eos_mass_lambda_file(mass_lambda_file)
 
             self.mass_lambda_interpolant = scipy.interpolate.interp1d(masses, lambdas)
-
             self.min_mass = np.min(masses)
             self.max_mass = np.max(masses)
 
